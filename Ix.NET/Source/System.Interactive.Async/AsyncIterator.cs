@@ -8,134 +8,103 @@ using System.Threading.Tasks;
 
 namespace System.Linq
 {
-    public static partial class AsyncEnumerable
+    internal abstract class AsyncIterator<TSource> : IAsyncEnumerable<TSource>, IAsyncEnumerator<TSource>
     {
-        internal abstract class AsyncIterator<TSource> : IAsyncEnumerable<TSource>, IAsyncEnumerator<TSource>
+        private readonly int threadId;
+
+        private bool currentIsInvalid = true;
+
+        internal TSource current;
+        internal AsyncIteratorState state = AsyncIteratorState.New;
+        internal CancellationToken token;
+
+        protected AsyncIterator()
         {
-            private readonly int threadId;
+            threadId = Environment.CurrentManagedThreadId;
+        }
 
-            private CancellationTokenSource cancellationTokenSource;
-            private bool currentIsInvalid = true;
+        public IAsyncEnumerator<TSource> GetAsyncEnumerator(CancellationToken token)
+        {
+            var enumerator = state == AsyncIteratorState.New && threadId == Environment.CurrentManagedThreadId
+                ? this
+                : Clone();
 
-            internal TSource current;
-            internal AsyncIteratorState state = AsyncIteratorState.New;
+            enumerator.state = AsyncIteratorState.Allocated;
+            enumerator.token = token;
 
-            protected AsyncIterator()
+            try
             {
-                threadId = Environment.CurrentManagedThreadId;
+                enumerator.OnGetEnumerator(token);
+            }
+            catch
+            {
+                enumerator.DisposeAsync(); // REVIEW: fire-and-forget?
+                throw;
             }
 
-            public IAsyncEnumerator<TSource> GetEnumerator()
+            return enumerator;
+        }
+
+        public virtual ValueTask DisposeAsync()
+        {
+            current = default(TSource);
+            state = AsyncIteratorState.Disposed;
+
+            return TaskExt.CompletedTask;
+        }
+
+        public TSource Current
+        {
+            get
             {
-                var enumerator = state == AsyncIteratorState.New && threadId == Environment.CurrentManagedThreadId ?
-                    this :
-                    Clone();
+                if (currentIsInvalid)
+                    throw new InvalidOperationException("Enumerator is in an invalid state");
 
-                enumerator.state = AsyncIteratorState.Allocated;
-                enumerator.cancellationTokenSource = new CancellationTokenSource();
-
-                try
-                {
-                    enumerator.OnGetEnumerator();
-                }
-                catch
-                {
-                    enumerator.Dispose();
-                    throw;
-                }
-
-                return enumerator;
-            }
-
-
-            public virtual void Dispose()
-            {
-                if (cancellationTokenSource != null)
-                {
-                    if (!cancellationTokenSource.IsCancellationRequested)
-                    {
-                        cancellationTokenSource.Cancel();
-                    }
-                    cancellationTokenSource.Dispose();
-                }
-
-                current = default;
-                state = AsyncIteratorState.Disposed;
-            }
-
-            public TSource Current
-            {
-                get
-                {
-                    if (currentIsInvalid)
-                    {
-                        throw new InvalidOperationException("Enumerator is in an invalid state");
-                    }
-
-                    return current;
-                }
-            }
-
-            public async Task<bool> MoveNext(CancellationToken cancellationToken)
-            {
-                // Note: MoveNext *must* be implemented as an async method to ensure
-                // that any exceptions thrown from the MoveNextCore call are handled 
-                // by the try/catch, whether they're sync or async
-
-                if (state == AsyncIteratorState.Disposed)
-                {
-                    return false;
-                }
-
-                using (cancellationToken.Register(Dispose))
-                using (var cts = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken, cancellationTokenSource.Token))
-                {
-                    try
-                    {
-                        // Short circuit and don't even call MoveNexCore
-                        cancellationToken.ThrowIfCancellationRequested();
-
-                        var result = await MoveNextCore(cts.Token)
-                                         .ConfigureAwait(false);
-
-                        currentIsInvalid = !result; // if move next is false, invalid otherwise valid
-
-                        return result;
-                    }
-                    catch
-                    {
-                        currentIsInvalid = true;
-                        Dispose();
-                        throw;
-                    }
-                }
-            }
-
-            public abstract AsyncIterator<TSource> Clone();
-
-            public virtual IAsyncEnumerable<TResult> Select<TResult>(Func<TSource, TResult> selector)
-            {
-                return new SelectEnumerableAsyncIterator<TSource, TResult>(this, selector);
-            }
-
-            public virtual IAsyncEnumerable<TSource> Where(Func<TSource, bool> predicate)
-            {
-                return new WhereEnumerableAsyncIterator<TSource>(this, predicate);
-            }
-
-            protected abstract Task<bool> MoveNextCore(CancellationToken cancellationToken);
-
-            protected virtual void OnGetEnumerator()
-            {
+                return current;
             }
         }
 
-        internal enum AsyncIteratorState
+        public async ValueTask<bool> MoveNextAsync()
         {
-            New = 0,
-            Allocated = 1,
-            Iterating = 2,
-            Disposed = -1
+            // Note: MoveNext *must* be implemented as an async method to ensure
+            // that any exceptions thrown from the MoveNextCore call are handled 
+            // by the try/catch, whether they're sync or async
+
+            if (state == AsyncIteratorState.Disposed)
+            {
+                return false;
+            }
+
+            try
+            {
+                var result = await MoveNextCore(token).ConfigureAwait(false);
+
+                currentIsInvalid = !result; // if move next is false, invalid otherwise valid
+
+                return result;
+            }
+            catch
+            {
+                currentIsInvalid = true;
+                await DisposeAsync().ConfigureAwait(false);
+                throw;
+            }
         }
+
+        public abstract AsyncIterator<TSource> Clone();
+
+        protected abstract ValueTask<bool> MoveNextCore(CancellationToken cancellationToken);
+
+        protected virtual void OnGetEnumerator(CancellationToken cancellationToken)
+        {
+        }
+    }
+
+    internal enum AsyncIteratorState
+    {
+        New = 0,
+        Allocated = 1,
+        Iterating = 2,
+        Disposed = -1,
     }
 }
